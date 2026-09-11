@@ -3,160 +3,253 @@
     Silently installs Win64 OpenSSL from Shining Light Productions.
 
 .DESCRIPTION
-    Resolves the latest full (not Light) Intel 64-bit EXE from the
-    published slproweb hash catalog and installs it silently.
-    Adds the OpenSSL bin folder to the machine PATH.
-    Document this vendor in the software approval request.
+    Resolves the latest full Intel 64-bit EXE from the slproweb hash catalog
+    and installs it silently. Adds the OpenSSL bin folder to the machine PATH.
+
+.PARAMETER Force
+    Reinstall even if OpenSSL is already present.
+
+.PARAMETER LogPath
+    Full path to the log file.
+
+.PARAMETER DownloadPath
+    Temporary folder for the installer.
+
+.PARAMETER ExpectedSha256
+    Optional SHA-256 to enforce. Catalog SHA-256 is used when this is omitted.
 
 .EXAMPLE
     .\install-openssl.ps1
 #>
+
+#Requires -RunAsAdministrator
+
 [CmdletBinding()]
 param(
     [switch]$Force,
     [string]$LogPath,
-    [string]$DownloadPath = (Join-Path $env:TEMP "OpenSslInstall"),
+    [string]$DownloadPath = (Join-Path $env:TEMP 'OpenSslInstall'),
     [string]$ExpectedSha256
 )
 
-#Requires -RunAsAdministrator
 $ErrorActionPreference = 'Stop'
 
 function Write-Log {
     [CmdletBinding()]
     param(
         [Parameter(Position = 0)]
-        [AllowEmptyString()]
-        [string]$Message = '',
-        [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS', 'DEBUG')]
-        [string]$Level = 'INFO',
-        [string]$LogPath = $script:LogPath
+        [string]$Message,
+        [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS')]
+        [string]$Level = 'INFO'
     )
-    if (-not $LogPath) { $LogPath = Join-Path $env:TEMP "SoftwareInstall_$(Get-Date -Format 'yyyyMMdd').log" }
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $entry = if ([string]::IsNullOrEmpty($Message)) { '' } else { "[$timestamp] [$Level] $Message" }
-    switch ($Level) {
-        'ERROR'   { Write-Host $entry -ForegroundColor Red }
-        'WARN'    { Write-Host $entry -ForegroundColor Yellow }
-        'SUCCESS' { Write-Host $entry -ForegroundColor Green }
-        default   { Write-Host $entry }
+
+    if (-not $script:LogPath) {
+        $script:LogPath = Join-Path $env:TEMP ("SoftwareInstall_{0}.log" -f (Get-Date -Format 'yyyyMMdd'))
     }
-    try {
-        $dir = Split-Path $LogPath -Parent
-        if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        Add-Content -Path $LogPath -Value $entry -ErrorAction SilentlyContinue
-    } catch { }
+
+    $entry = '[{0}] [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+
+    switch ($Level) {
+        'ERROR' { Write-Host $entry -ForegroundColor Red }
+        'WARN' { Write-Host $entry -ForegroundColor Yellow }
+        'SUCCESS' { Write-Host $entry -ForegroundColor Green }
+        default { Write-Host $entry }
+    }
+
+    $logDir = Split-Path $script:LogPath -Parent
+    if ($logDir -and -not (Test-Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+    Add-Content -Path $script:LogPath -Value $entry
 }
 
 function Test-InstallerIntegrity {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string[]]$ExpectedPublishers,
-        [string]$ExpectedSha256,
-        [switch]$AllowUnsigned
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string[]]$ExpectedPublishers,
+        [string]$ExpectedSha256
     )
-    if (-not (Test-Path -LiteralPath $Path)) { throw "Integrity check failed: file not found: $Path" }
-    Write-Log "Running integrity checks"
-    $actualHash = (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToUpperInvariant()
-    Write-Log "SHA256 recorded"
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Integrity check failed: file not found: $Path"
+    }
+
     if ($ExpectedSha256) {
+        $actualHash = (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToUpperInvariant()
         $expected = $ExpectedSha256.Trim().ToUpperInvariant()
-        if ($actualHash -ne $expected) { throw "SHA-256 mismatch" }
-        Write-Log "SHA-256 verified" -Level SUCCESS
-    }
-    else {
-        Write-Log "No ExpectedSha256 supplied. Hash logged only." -Level WARN
-    }
-    $sig = Get-AuthenticodeSignature -FilePath $Path
-    Write-Log "Authenticode status checked"
-    if ($sig.Status -ne 'Valid') {
-        if ($AllowUnsigned) {
-            Write-Log "Signature not valid. AllowUnsigned specified." -Level WARN
-            if (-not $ExpectedSha256) {
-                Write-Log "Unsigned file with no ExpectedSha256. Continuing with audit hash only." -Level WARN
-            }
-            return
+        if ($actualHash -ne $expected) {
+            throw "SHA-256 mismatch. Expected $expected but got $actualHash"
         }
-        throw "Authenticode signature is not valid"
     }
-    $subject = $sig.SignerCertificate.Subject
-    $matched = $false
-    foreach ($pub in $ExpectedPublishers) {
-        if ($subject -like "*$pub*") { $matched = $true; Write-Log "Publisher matched" -Level SUCCESS; break }
+
+    $sig = Get-AuthenticodeSignature -FilePath $Path
+    if ($sig.Status -eq 'Valid') {
+        $subject = $sig.SignerCertificate.Subject
+        $matched = $false
+        foreach ($pub in $ExpectedPublishers) {
+            if ($subject -like "*$pub*") {
+                $matched = $true
+                break
+            }
+        }
+        if (-not $matched) {
+            throw "Unexpected publisher. Subject='$subject'"
+        }
+        return
     }
-    if (-not $matched) { throw "Unexpected publisher" }
-    Write-Log "Integrity checks passed" -Level SUCCESS
+
+    if (-not $ExpectedSha256) {
+        throw "Authenticode signature is not valid and no SHA-256 was supplied. Status=$($sig.Status)"
+    }
+
+    Write-Log ('Authenticode not valid ({0}); catalog SHA-256 was verified' -f $sig.Status) -Level WARN
+}
+
+function Get-InstalledOpenSsl {
+    $exe = Join-Path $env:ProgramFiles 'OpenSSL-Win64\bin\openssl.exe'
+    if (Test-Path $exe) {
+        return (Get-Item $exe).VersionInfo.ProductVersion
+    }
+    return $null
 }
 
 function Add-MachinePath {
     param([string]$Directory)
+
     if (-not (Test-Path $Directory)) { return }
+
     $current = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $parts = $current -split ';' | Where-Object { $_ }
     if ($parts -contains $Directory) { return }
-    [Environment]::SetEnvironmentVariable('Path', ($parts + $Directory) -join ';', 'Machine')
+
+    [Environment]::SetEnvironmentVariable('Path', (($parts + $Directory) -join ';'), 'Machine')
     $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
-    Write-Log "Added directory to machine PATH"
 }
 
-function Invoke-Download {
-    param([string]$Url, [string]$OutFile)
-    Write-Log "Downloading file"
-    Write-Log "URL logged"
-    $ProgressPreference = 'SilentlyContinue'
-    Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
-    if (-not (Test-Path $OutFile) -or (Get-Item $OutFile).Length -lt 10KB) {
-        throw "Download failed or file is too small"
+function Get-LatestOpenSslDownloadInfo {
+    $catalog = Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/slproweb/opensslhashes/master/win32_openssl_hashes.json' -TimeoutSec 30
+    $candidates = @()
+
+    foreach ($name in $catalog.files.PSObject.Properties.Name) {
+        $item = $catalog.files.$name
+        $isFull = ($item.light -eq $false)
+        $is64 = ($item.bits -eq 64)
+        $isExe = ($item.installer -eq 'exe')
+        $isIntel = ($item.arch -eq 'INTEL' -or $item.arch -eq 'intel')
+        if ($isFull -and $is64 -and $isExe -and $isIntel) {
+            $candidates += $item
+        }
     }
-    Write-Log "Download complete" -Level SUCCESS
+
+    if (-not $candidates) {
+        throw 'Could not resolve a Win64 OpenSSL EXE from the catalog.'
+    }
+
+    $chosen = $candidates |
+    Sort-Object { [version](($_.basever -replace '[^\d.].*$', '')) } |
+    Select-Object -Last 1
+
+    [pscustomobject]@{
+        Version = $chosen.basever
+        Url     = $chosen.url
+        Sha256  = $chosen.sha256
+    }
 }
 
-$logDir = "C:\ProgramData\SDL\scripts\logs"
-if (-not $LogPath) { $LogPath = Join-Path $logDir ("Install-OpenSsl_{0}.log" -f (Get-Date -Format 'yyyyMMdd')) }
-$script:LogPath = $LogPath
+if ($LogPath) {
+    $script:LogPath = $LogPath
+}
+else {
+    $logDir = 'C:\ProgramData\SDL\scripts\logs'
+    $script:LogPath = Join-Path $logDir ("Install-OpenSsl_{0}.log" -f (Get-Date -Format 'yyyyMMdd'))
+}
 
-Write-Log "===== Starting OpenSSL installation ====="
+Write-Log 'Starting OpenSSL install'
 
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $opensslCmd = Get-Command openssl -ErrorAction SilentlyContinue
-    if ($opensslCmd -and -not $Force) {
-        Write-Log "OpenSSL already present. Skipping." -Level SUCCESS
+
+    $installedVersion = Get-InstalledOpenSsl
+    if ($installedVersion -and -not $Force) {
+        Write-Log ('OpenSSL already installed: {0}' -f $installedVersion) -Level SUCCESS
+        Write-Log 'Install finished' -Level SUCCESS
         exit 0
     }
 
-    if (-not (Test-Path $DownloadPath)) { New-Item -ItemType Directory -Path $DownloadPath -Force | Out-Null }
-
-    Write-Log "Resolving latest Win64 OpenSSL installer catalog"
-    $catalog = Invoke-RestMethod -Uri "https://raw.githubusercontent.com/slproweb/opensslhashes/master/win32_openssl_hashes.json"
-    $chosen = $null
-    foreach ($name in $catalog.files.PSObject.Properties.Name) {
-        $item = $catalog.files.$name
-        if ($item.light -eq $false -and $item.bits -eq 64 -and $item.installer -eq 'exe' -and ($item.arch -eq 'INTEL' -or $item.arch -eq 'intel')) {
-            $chosen = $item
-        }
+    if ($installedVersion -and $Force) {
+        Write-Log ('OpenSSL {0} found; Force specified' -f $installedVersion) -Level WARN
     }
-    if (-not $chosen) { throw "Could not resolve a Win64 OpenSSL EXE from the catalog" }
+    else {
+        Write-Log 'OpenSSL not detected; installing latest'
+    }
 
-    $exe = Join-Path $DownloadPath "Win64OpenSSL.exe"
-    Invoke-Download -Url $chosen.url -OutFile $exe
-    $hashToUse = if ($ExpectedSha256) { $ExpectedSha256 } else { $null }
-    Test-InstallerIntegrity -Path $exe -ExpectedPublishers @('Shining Light','slproweb','OpenSSL') -ExpectedSha256 $hashToUse -AllowUnsigned
+    if (-not (Test-Path $DownloadPath)) {
+        New-Item -ItemType Directory -Path $DownloadPath -Force | Out-Null
+    }
 
-    $installDir = Join-Path $env:ProgramFiles "OpenSSL-Win64"
-    Write-Log "Starting silent OpenSSL install"
-    $args = @('/VERYSILENT','/NORESTART','/SUPPRESSMSGBOXES','/SP-','/tasks=copytobin',"/DIR=`"$installDir`"")
-    $p = Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru
-    if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "OpenSSL installer exited with a non-zero code" }
-    Write-Log "OpenSSL installer finished" -Level SUCCESS
-    Add-MachinePath -Directory (Join-Path $installDir "bin")
+    $downloadInfo = Get-LatestOpenSslDownloadInfo
+    $installerPath = Join-Path $DownloadPath 'Win64OpenSSL.exe'
+    Write-Log ('Downloading OpenSSL {0}' -f $downloadInfo.Version)
 
-    Remove-Item $exe -Force -ErrorAction SilentlyContinue
-    Write-Log "===== OpenSSL installation finished =====" -Level SUCCESS
+    $ProgressPreference = 'SilentlyContinue'
+    Invoke-WebRequest -Uri $downloadInfo.Url -OutFile $installerPath -UseBasicParsing
+
+    if (-not (Test-Path $installerPath) -or (Get-Item $installerPath).Length -lt 1MB) {
+        throw 'Download failed or file is too small.'
+    }
+
+    $hashToUse = $ExpectedSha256
+    if (-not $hashToUse) { $hashToUse = $downloadInfo.Sha256 }
+
+    $integrityParams = @{
+        Path               = $installerPath
+        ExpectedPublishers = @('Shining Light', 'slproweb', 'OpenSSL')
+    }
+    if ($hashToUse) {
+        $integrityParams['ExpectedSha256'] = $hashToUse
+    }
+    Test-InstallerIntegrity @integrityParams
+
+    $installDir = Join-Path $env:ProgramFiles 'OpenSSL-Win64'
+    Write-Log 'Installing OpenSSL'
+    $setupArgs = @(
+        '/VERYSILENT'
+        '/NORESTART'
+        '/SUPPRESSMSGBOXES'
+        '/SP-'
+        '/tasks=copytobin'
+        ('/DIR={0}' -f $installDir)
+    )
+    $processParams = @{
+        FilePath     = $installerPath
+        ArgumentList = $setupArgs
+        Wait         = $true
+        PassThru     = $true
+    }
+    $process = Start-Process @processParams
+
+    if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+        throw "OpenSSL installer returned non-zero exit code: $($process.ExitCode)"
+    }
+
+    Add-MachinePath -Directory (Join-Path $installDir 'bin')
+
+    $newVersion = Get-InstalledOpenSsl
+    if ($newVersion) {
+        Write-Log ('OpenSSL installed: {0}' -f $newVersion) -Level SUCCESS
+    }
+    else {
+        Write-Log 'Installer succeeded but OpenSSL version was not detected.' -Level WARN
+    }
+
+    Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
+    Write-Log 'Install finished' -Level SUCCESS
     exit 0
 }
 catch {
-    Write-Log "ERROR during OpenSSL install" -Level ERROR
     Write-Log $_.Exception.Message -Level ERROR
     exit 1
 }

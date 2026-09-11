@@ -2,156 +2,215 @@
 .SYNOPSIS
     Silently installs Git for Windows (64-bit).
 
-.DESCRIPTION
-    Downloads the latest official Git for Windows 64-bit installer from GitHub
-    and installs it silently. Idempotent unless -Force is used.
+.PARAMETER Force
+    Reinstall even if Git is already present.
+
+.PARAMETER LogPath
+    Full path to the log file.
+
+.PARAMETER DownloadPath
+    Temporary folder for the installer.
+
+.PARAMETER ExpectedSha256
+    Optional SHA-256 to enforce.
 
 .EXAMPLE
     .\install-git.ps1
 #>
+
+#Requires -RunAsAdministrator
+
 [CmdletBinding()]
 param(
     [switch]$Force,
     [string]$LogPath,
-    [string]$DownloadPath = (Join-Path $env:TEMP "GitInstall"),
+    [string]$DownloadPath = (Join-Path $env:TEMP 'GitInstall'),
     [string]$ExpectedSha256
 )
 
-#Requires -RunAsAdministrator
 $ErrorActionPreference = 'Stop'
 
 function Write-Log {
     [CmdletBinding()]
     param(
         [Parameter(Position = 0)]
-        [AllowEmptyString()]
-        [string]$Message = '',
-        [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS', 'DEBUG')]
-        [string]$Level = 'INFO',
-        [string]$LogPath = $script:LogPath
+        [string]$Message,
+        [ValidateSet('INFO', 'WARN', 'ERROR', 'SUCCESS')]
+        [string]$Level = 'INFO'
     )
-    if (-not $LogPath) { $LogPath = Join-Path $env:TEMP "SoftwareInstall_$(Get-Date -Format 'yyyyMMdd').log" }
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $entry = if ([string]::IsNullOrEmpty($Message)) { '' } else { "[$timestamp] [$Level] $Message" }
-    switch ($Level) {
-        'ERROR'   { Write-Host $entry -ForegroundColor Red }
-        'WARN'    { Write-Host $entry -ForegroundColor Yellow }
-        'SUCCESS' { Write-Host $entry -ForegroundColor Green }
-        default   { Write-Host $entry }
+
+    if (-not $script:LogPath) {
+        $script:LogPath = Join-Path $env:TEMP ("SoftwareInstall_{0}.log" -f (Get-Date -Format 'yyyyMMdd'))
     }
-    try {
-        $dir = Split-Path $LogPath -Parent
-        if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        Add-Content -Path $LogPath -Value $entry -ErrorAction SilentlyContinue
-    } catch { }
+
+    $entry = '[{0}] [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+
+    switch ($Level) {
+        'ERROR' { Write-Host $entry -ForegroundColor Red }
+        'WARN' { Write-Host $entry -ForegroundColor Yellow }
+        'SUCCESS' { Write-Host $entry -ForegroundColor Green }
+        default { Write-Host $entry }
+    }
+
+    $logDir = Split-Path $script:LogPath -Parent
+    if ($logDir -and -not (Test-Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+    Add-Content -Path $script:LogPath -Value $entry
 }
 
 function Test-InstallerIntegrity {
+    [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string[]]$ExpectedPublishers,
-        [string]$ExpectedSha256,
-        [switch]$AllowUnsigned
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string[]]$ExpectedPublishers,
+        [string]$ExpectedSha256
     )
-    if (-not (Test-Path -LiteralPath $Path)) { throw "Integrity check failed: file not found: $Path" }
-    Write-Log "Running integrity checks"
-    $actualHash = (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToUpperInvariant()
-    Write-Log "SHA256 recorded"
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Integrity check failed: file not found: $Path"
+    }
+
     if ($ExpectedSha256) {
+        $actualHash = (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToUpperInvariant()
         $expected = $ExpectedSha256.Trim().ToUpperInvariant()
-        if ($actualHash -ne $expected) { throw "SHA-256 mismatch" }
-        Write-Log "SHA-256 verified" -Level SUCCESS
-    }
-    else {
-        Write-Log "No ExpectedSha256 supplied. Hash logged only." -Level WARN
-    }
-    $sig = Get-AuthenticodeSignature -FilePath $Path
-    Write-Log "Authenticode status checked"
-    if ($sig.Status -ne 'Valid') {
-        if ($AllowUnsigned) {
-            Write-Log "Signature not valid. AllowUnsigned specified." -Level WARN
-            if (-not $ExpectedSha256) {
-                Write-Log "Unsigned file with no ExpectedSha256. Continuing with audit hash only." -Level WARN
-            }
-            return
+        if ($actualHash -ne $expected) {
+            throw "SHA-256 mismatch. Expected $expected but got $actualHash"
         }
-        throw "Authenticode signature is not valid"
     }
+
+    $sig = Get-AuthenticodeSignature -FilePath $Path
+    if ($sig.Status -ne 'Valid') {
+        throw "Authenticode signature is not valid. Status=$($sig.Status)"
+    }
+
     $subject = $sig.SignerCertificate.Subject
     $matched = $false
     foreach ($pub in $ExpectedPublishers) {
-        if ($subject -like "*$pub*") { $matched = $true; Write-Log "Publisher matched" -Level SUCCESS; break }
+        if ($subject -like "*$pub*") {
+            $matched = $true
+            break
+        }
     }
-    if (-not $matched) { throw "Unexpected publisher" }
-    Write-Log "Integrity checks passed" -Level SUCCESS
-}
-
-function Add-MachinePath {
-    param([string]$Directory)
-    if (-not (Test-Path $Directory)) { return }
-    $current = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    $parts = $current -split ';' | Where-Object { $_ }
-    if ($parts -contains $Directory) { return }
-    [Environment]::SetEnvironmentVariable('Path', ($parts + $Directory) -join ';', 'Machine')
-    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
-    Write-Log "Added directory to machine PATH"
-}
-
-function Invoke-Download {
-    param([string]$Url, [string]$OutFile)
-    Write-Log "Downloading file"
-    Write-Log "URL logged"
-    $ProgressPreference = 'SilentlyContinue'
-    Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
-    if (-not (Test-Path $OutFile) -or (Get-Item $OutFile).Length -lt 10KB) {
-        throw "Download failed or file is too small"
+    if (-not $matched) {
+        throw "Unexpected publisher. Subject='$subject'"
     }
-    Write-Log "Download complete" -Level SUCCESS
 }
 
-$logDir = "C:\ProgramData\SDL\scripts\logs"
-if (-not $LogPath) { $LogPath = Join-Path $logDir ("Install-Git_{0}.log" -f (Get-Date -Format 'yyyyMMdd')) }
-$script:LogPath = $LogPath
+function Get-InstalledGitVersion {
+    $gitExe = Join-Path $env:ProgramFiles 'Git\cmd\git.exe'
+    if (Test-Path $gitExe) {
+        $ver = & $gitExe --version 2>$null
+        if ($ver) { return ([string]$ver).Trim() }
+    }
 
-Write-Log "===== Starting Git CLI installation ====="
-Write-Log "Force : $Force"
+    $cmd = Get-Command git -ErrorAction SilentlyContinue
+    if ($cmd) {
+        $ver = & $cmd.Source --version 2>$null
+        if ($ver) { return ([string]$ver).Trim() }
+    }
+
+    return $null
+}
+
+if ($LogPath) {
+    $script:LogPath = $LogPath
+}
+else {
+    $logDir = 'C:\ProgramData\SDL\scripts\logs'
+    $script:LogPath = Join-Path $logDir ("Install-Git_{0}.log" -f (Get-Date -Format 'yyyyMMdd'))
+}
+
+Write-Log 'Starting Git install'
 
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $gitCmd = Get-Command git -ErrorAction SilentlyContinue
-    if ($gitCmd -and -not $Force) {
-        Write-Log "Git already present. Skipping. Use -Force to reinstall." -Level SUCCESS
+
+    $installedVersion = Get-InstalledGitVersion
+    if ($installedVersion -and -not $Force) {
+        Write-Log ('Git already installed: {0}' -f $installedVersion) -Level SUCCESS
+        Write-Log 'Install finished' -Level SUCCESS
         exit 0
     }
 
-    if (-not (Test-Path $DownloadPath)) { New-Item -ItemType Directory -Path $DownloadPath -Force | Out-Null }
+    if ($installedVersion -and $Force) {
+        Write-Log ('Git found ({0}); Force specified' -f $installedVersion) -Level WARN
+    }
+    else {
+        Write-Log 'Git not detected; installing latest'
+    }
 
-    Write-Log "Querying GitHub releases for git-for-windows/git"
-    $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/git-for-windows/git/releases/latest" -Headers @{ 'User-Agent' = 'SDL-ImageBuilder' }
-    $asset = $rel.assets | Where-Object { $_.name -match '^Git-.*-64-bit\.exe$' } | Select-Object -First 1
-    if (-not $asset) { throw "Could not find 64-bit Git installer asset" }
+    if (-not (Test-Path $DownloadPath)) {
+        New-Item -ItemType Directory -Path $DownloadPath -Force | Out-Null
+    }
 
-    $exe = Join-Path $DownloadPath $asset.name
-    Invoke-Download -Url $asset.browser_download_url -OutFile $exe
-    Test-InstallerIntegrity -Path $exe -ExpectedPublishers @('Git for Windows','Johannes Schindelin','GitHub') -ExpectedSha256 $ExpectedSha256
+    $headers = @{
+        'User-Agent' = 'PowerShell-Git-Installer'
+        'Accept'     = 'application/vnd.github+json'
+    }
+    $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/git-for-windows/git/releases/latest' -Headers $headers -TimeoutSec 30
+    $asset = $release.assets | Where-Object { $_.name -match '^Git-.*-64-bit\.exe$' } | Select-Object -First 1
+    if (-not $asset) {
+        throw 'Could not find a 64-bit Git installer asset.'
+    }
 
-    Write-Log "Starting silent Git install"
-    $args = @('/VERYSILENT','/NORESTART','/NOCANCEL','/SP-','/CLOSEAPPLICATIONS','/COMPONENTS=gitlfs,assoc,windowsterminal','/o:PathOption=CmdTools')
-    $p = Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru
-    if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { throw "Git installer exited with a non-zero code" }
-    Write-Log "Git installer finished" -Level SUCCESS
+    $installerPath = Join-Path $DownloadPath $asset.name
+    Write-Log ('Downloading Git {0}' -f ($release.tag_name -replace '^v', ''))
 
-    $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
-    $gitCmd = Get-Command git -ErrorAction SilentlyContinue
-    if ($gitCmd) { Write-Log "Git verified on PATH" -Level SUCCESS }
-    else { Write-Log "Git installed. Open a new shell to refresh PATH." -Level WARN }
+    $ProgressPreference = 'SilentlyContinue'
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installerPath -UseBasicParsing
 
-    Remove-Item $exe -Force -ErrorAction SilentlyContinue
-    Write-Log "===== Git CLI installation finished =====" -Level SUCCESS
+    if (-not (Test-Path $installerPath) -or (Get-Item $installerPath).Length -lt 5MB) {
+        throw 'Download failed or file is too small.'
+    }
+
+    $integrityParams = @{
+        Path               = $installerPath
+        ExpectedPublishers = @('Git for Windows', 'Johannes Schindelin', 'GitHub')
+    }
+    if ($ExpectedSha256) {
+        $integrityParams['ExpectedSha256'] = $ExpectedSha256
+    }
+    Test-InstallerIntegrity @integrityParams
+
+    Write-Log 'Installing Git'
+    $setupArgs = @(
+        '/VERYSILENT'
+        '/NORESTART'
+        '/NOCANCEL'
+        '/SP-'
+        '/CLOSEAPPLICATIONS'
+        '/COMPONENTS=gitlfs,assoc,windowsterminal'
+        '/o:PathOption=CmdTools'
+    )
+    $processParams = @{
+        FilePath     = $installerPath
+        ArgumentList = $setupArgs
+        Wait         = $true
+        PassThru     = $true
+    }
+    $process = Start-Process @processParams
+
+    if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010) {
+        throw "Git installer returned non-zero exit code: $($process.ExitCode)"
+    }
+
+    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+    $newVersion = Get-InstalledGitVersion
+    if ($newVersion) {
+        Write-Log ('Git installed: {0}' -f $newVersion) -Level SUCCESS
+    }
+    else {
+        Write-Log 'Installer succeeded but Git was not detected on PATH.' -Level WARN
+    }
+
+    Remove-Item -Path $installerPath -Force -ErrorAction SilentlyContinue
+    Write-Log 'Install finished' -Level SUCCESS
     exit 0
 }
 catch {
-    Write-Log "ERROR during Git install" -Level ERROR
     Write-Log $_.Exception.Message -Level ERROR
     exit 1
 }
