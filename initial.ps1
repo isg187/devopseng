@@ -138,31 +138,23 @@ try {
         Write-Log "Starting: $name"
         Write-Log "Script  : $scriptPath"
 
+        if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) {
+            Write-Log "Script not found $scriptPath" -Level ERROR
+            $results += [pscustomobject]@{ Name = $name; Success = $false; Message = "File not found" }
+            $overallSuccess = $false
+            continue
+        }
+
         try {
-            $argList = @(
-                "-NoProfile"
-                "-ExecutionPolicy", "Bypass"
-                "-File", $scriptPath
-                "-Force"
-            )
-
-            $proc = Start-Process -FilePath "powershell.exe" `
-                -ArgumentList $argList `
-                -Wait -PassThru -NoNewWindow
-
-            if ($proc.ExitCode -eq 0) {
-                Write-Log "$name completed successfully." -Level SUCCESS
-                $results += [pscustomobject]@{ Name = $name; Success = $true; Message = "OK" }
+            & $scriptPath -Force
+            if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+                throw "Exit code $LASTEXITCODE"
             }
-            else {
-                Write-Log "$name failed with exit code $($proc.ExitCode)." -Level ERROR
-                $results += [pscustomobject]@{ Name = $name; Success = $false; Message = "Exit code $($proc.ExitCode)" }
-                $overallSuccess = $false
-                # Continue remaining installers so one failure does not skip the rest
-            }
+            Write-Log "$name completed successfully." -Level SUCCESS
+            $results += [pscustomobject]@{ Name = $name; Success = $true; Message = "OK" }
         }
         catch {
-            Write-Log "Exception while running $name : $($_.Exception.Message)" -Level ERROR
+            Write-Log "$name failed: $($_.Exception.Message)" -Level ERROR
             $results += [pscustomobject]@{ Name = $name; Success = $false; Message = $_.Exception.Message }
             $overallSuccess = $false
         }

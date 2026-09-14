@@ -172,14 +172,23 @@ try {
         }
         else {
             $release = Get-GitHubLatestRelease -Repo 'helm/helm'
-            $asset = $release.assets | Where-Object { $_.name -match 'windows-amd64\.zip$' } | Select-Object -First 1
-            if (-not $asset) {
-                throw 'Could not find Helm windows-amd64 zip.'
+            $ver = $release.tag_name
+            if ($ver -notmatch '^v\d') {
+                throw "Unexpected Helm tag $ver"
             }
 
-            Write-Log ('Downloading Helm {0}' -f ($release.tag_name -replace '^v', ''))
+            $zipUrl = 'https://get.helm.sh/helm-{0}-windows-amd64.zip' -f $ver
+            $hashUrl = 'https://get.helm.sh/helm-{0}-windows-amd64.zip.sha256sum' -f $ver
             $zipPath = Join-Path $DownloadPath 'helm.zip'
-            Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $zipPath -UseBasicParsing
+            Write-Log ('Downloading Helm {0}' -f ($ver -replace '^v', ''))
+            Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
+
+            $vendorHash = $null
+            try {
+                $hashContent = (Invoke-WebRequest -Uri $hashUrl -UseBasicParsing).Content.Trim()
+                $vendorHash = ($hashContent -split '\s+')[0]
+            }
+            catch { }
 
             $extractPath = Join-Path $DownloadPath 'helm'
             if (Test-Path $extractPath) {
@@ -192,7 +201,7 @@ try {
                 throw 'helm.exe not found in zip.'
             }
 
-            Test-BinaryIntegrity -Path $helmExe.FullName
+            Test-BinaryIntegrity -Path $helmExe.FullName -ExpectedSha256 $vendorHash
             Copy-Item -Path $helmExe.FullName -Destination $dest -Force
             Write-Log 'Helm installed' -Level SUCCESS
         }
